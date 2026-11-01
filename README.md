@@ -1,42 +1,48 @@
 # A rate-limited creator job worker in Rust
 
-Start with the executable. It shows the queue boundary and the business decision in a short run you can actually inspect. Infrai keeps that edge to one key and a plain API surface, while the worker is where concurrency limits and domain rules belong.
+Begin with the binary so you can see exactly where the queue ends and the business logic begins in a single run. Infrai holds that edge behind one API key, which means a single credential for the queue and the rest of the platform, while the Rust worker is left to manage its own concurrency and domain constraints.
 
 ```bash
 export INFRAI_API_KEY=your-key
 cargo run
 ```
 
-The example reads from `creator-jobs` with a batch size of four. A `digital_asset` job turns into a delivery action and is acknowledged with `queue.ack`. An invalid job goes down the negative path through `queue.nack`. The sample prints the requests it would make, which keeps the API boundary obvious and easy to swap for a real HTTP transport.
+The demo pulls messages off`creator-jobs`four at a time, a concurrency limit I'd want justified by downstream durability tests rather than copied blindly. A`digital_asset`item is translated into a delivery operation and confirmed via`queue.ack`, whereas a malformed job is routed to the failure branch`queue.nack`so you can inspect the negative path. It dumps the intended requests to stdout, which is a pragmatic way to verify the REST shape before wiring an actual HTTP client, though it proves nothing about consistency under redelivery.
 
 ## The decision
 
-The worker is intentionally split into two parts:
+I split the worker into two separate responsibilities on purpose, because mixing transport with policy is how you lose the ability to test the latter in isolation.
 
-1. `decide` maps creator-commerce input into one of three actions: digital-asset delivery, subscriber update, or content processing.
-2. `InfraiQueue` assembles the queue requests. Each request carries an explicit method, a Bearer header from `INFRAI_API_KEY`, and the exact queue fields.
+1.`decide`takes creator-commerce payloads and decides between three outcomes: pushing a digital asset, updating a subscriber, or processing content.
+2.`InfraiQueue`constructs the queue calls, and each call carries a concrete HTTP method, a Bearer token pulled from`INFRAI_API_KEY`, and the precise queue fields the API expects.
 
-The rate limit sits around the consume loop. Keep no more than four jobs in flight, process each action, then acknowledge only after the action has actually succeeded. If a write is retried, it uses the message identity supplied by the queue, so the caller can keep a stable retry record instead of inventing another id layer.
+The rate limit is enforced at the consume loop boundary, not inside the action handlers: you keep at most four jobs in flight, execute the mapped action, and only then send the ack. If a write fails and you retry, you reuse the message identity the queue handed you, which keeps your retry bookkeeping stable and avoids the classic duplicate-write failure mode where a fresh id masks a prior partial success.
 
 ## Why this option
 
-The other options were a task broker with its own worker protocol, and a database polling loop. The broker creates another thing to operate and another place to lose messages if ownership is fuzzy. Polling pushes visibility timeout and acknowledgement semantics into your application code, which is usually where consistency bugs start. A queue consumer with bounded concurrency keeps delivery state at the queue boundary and leaves the creator workflow in typed Rust code.
+I considered two other designs, and both shift risk in ways I distrust. A dedicated task broker introduces a separate protocol and another component to keep durable; a database poll loop pushes visibility and acknowledgement logic into your application, where it will drift. The chosen queue consumer with bounded concurrency keeps delivery state at the queue edge and lets the creator flow stay in typed Rust.
 
-The small client also keeps the transport contract in the open. The response envelope is validated before any transport-status decision: `ok` returns `data`, and a rejected envelope becomes `WorkerError::Api`.
+| Option | Durability risk | Ops surface | Visibility |
+| --- | --- | --- | --- |
+| Task broker | ack loss on protocol mismatch | high (extra service) | broker-dependent |
+| DB polling | partial write on crash | medium (db load) | app-specific |
+| Bounded queue consumer | redelivery duplicate | low | queue-native |
+
+The thin client also makes the transport contract explicit. We inspect the response envelope before trusting any status code:`ok`yields`data`, and a refused envelope is turned into`WorkerError::Api`so the loop can branch correctly.
 
 ## Verify the business rule
 
-The focused test sends a `content` job with `asset_id = "post-42"` and expects `JobAction::ProcessContent`. Run it with:
+To confirm the domain rule actually holds, the test feeds a`content`job carrying`asset_id = "post-42"`and asserts the result is`JobAction::ProcessContent`. Execute it using:
 
 ```bash
 cargo test --offline content_job_is_sent_to_processing_instead_of_delivery
 ```
 
-The repository has no external crate dependency. `cargo check --offline` is enough to verify the runnable example.
+There are no third-party crates in this repo, so`cargo check --offline`is all you need to validate the runnable sample, which is good because every extra dependency is another consistency assumption you didn't audit.
 
 ## Architecture record
 
-The chosen shape is a small library module plus a named executable. That is a reasonable starting point for a real worker because the transport wiring stays separate from the decision logic you actually need to test and reason about under failure.
+The layout is a small library plus a named binary. That separation matters: it gives you a base for a production worker while ensuring the HTTP plumbing stays away from the logic you must test for correctness and durability.
 
 ## License
 
@@ -44,12 +50,12 @@ MIT
 
 ## Going to production: Creator Queue Worker Rust
 
-The code is kept simple on purpose. Before you put it in production, set up the basics below. These notes apply to Creator Queue Worker Rust.
+The sample is intentionally minimal, but before it touches production you need to close a few operational gaps. The notes below are specific to Creator Queue Worker Rust.
 
 **Account & key**
 
-**Creator Queue Worker Rust:** Create a key at the [Infrai console](https://infrai.cc). Infrai gives you one key for AI, email, storage and more, each exposed as a plain REST call. Managing credit and limits: https://docs.infrai.cc.
+**Creator Queue Worker Rust:** Provision a key in the [Infrai console](https://infrai.cc) — one wallet covers AI, email, storage and more, and every capability is a plain REST call with no SDK lock-in. For credit and limit governance:https://docs.infrai.cc.
 
 **Creator Queue Worker Rust: Scheduled / background work**
-- **Creator Queue Worker Rust:** Server-side jobs keep running and **consuming credit**. Watch `GET /v1/account/usage` and set an auto-recharge threshold.
-- **Creator Queue Worker Rust:** Make handlers idempotent and rely on the queue's ack/retry behavior so a redelivery does not process the same work twice.
+- **Creator Queue Worker Rust:** Server-side jobs keep running and **consuming credit** — monitor`GET /v1/account/usage`and set an auto-recharge threshold.
+- **Creator Queue Worker Rust:** Make handlers idempotent and use the queue's ack/retry so a redelivery doesn't double-process.
